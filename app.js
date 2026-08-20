@@ -6,9 +6,14 @@ const {
 } = React;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// APP VERSION — increment only when DEFAULT_WORKOUTS schema changes
+// CLOUD DATA STORE — Supabase
+// Fill these in with your project's values (Project Settings → API).
+// The anon/public key is safe to expose here — access is locked down by
+// Row Level Security in the database, not by hiding this key.
 // ─────────────────────────────────────────────────────────────────────────────
-const V = 8;
+const SUPABASE_URL = "https://cwauyjsqgshhqdpcwnqr.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN3YXV5anNxZ3NoaHFkcGN3bnFyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcyNDYzMjgsImV4cCI6MjEwMjgyMjMyOH0.ipRhoTDWUJulsuTko25DrsRQoMBgcfnvV2fu4jD_NoA";
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SCHEDULE
@@ -443,16 +448,6 @@ function lsGet(key, fb) {
     return fb;
   }
 }
-function lsSet(key, val) {
-  try {
-    localStorage.setItem(key, JSON.stringify(val));
-  } catch (e) {}
-}
-function lsClear(key) {
-  try {
-    localStorage.removeItem(key);
-  } catch (e) {}
-}
 
 // Epley 1RM — doubles weight for dumbbell exercises (per-hand input)
 function epley(w, r, exName) {
@@ -580,29 +575,99 @@ function App() {
   const todayDow = getNZDay();
   const todaySched = SCHEDULE.find(s => DOW_MAP[s.day] === todayDow);
 
-  // ── Initialise persistent state — version check wipes stale data on upgrade ──
-  const [workouts, setWorkouts] = useState(() => {
-    const v = lsGet("wl-v", 0);
-    if (v < V) {
-      lsSet("wl-v", V);
-      lsClear("wl-wo");
-      lsClear("wl-dn");
-      lsClear("wl-logs");
-      lsClear("wl-rm");
-      return DEFAULT_WORKOUTS;
-    }
-    return lsGet("wl-wo", DEFAULT_WORKOUTS);
-  });
-  const [dayNames, setDayNames] = useState(() => {
-    // wl-v was already set to V by workouts init if it was stale,
-    // so a second read here always reflects the current version.
-    return lsGet("wl-v", 0) < V ? DEFAULT_DAY_NAMES : lsGet("wl-dn", DEFAULT_DAY_NAMES);
-  });
-  const [workoutLogs, setWorkoutLogs] = useState(() => lsGet("wl-logs", {}));
-  const [rmHistory, setRmHistory] = useState(() => lsGet("wl-rm", {}));
-  const [rmLifts, setRmLifts] = useState(() => lsGet("wl-rm-lifts", DEFAULT_RM_LIFTS));
-  const [rmRepsLifts, setRmRepsLifts] = useState(() => new Set(lsGet("wl-rm-reps", DEFAULT_RM_REPS_LIFTS)));
-  const [fontSize, setFontSize] = useState(() => lsGet("wl-fs", "medium"));
+  // ── Persistent state — starts at defaults, filled in from the cloud once logged in ──
+  const [workouts, setWorkouts] = useState(DEFAULT_WORKOUTS);
+  const [dayNames, setDayNames] = useState(DEFAULT_DAY_NAMES);
+  const [workoutLogs, setWorkoutLogs] = useState({});
+  const [rmHistory, setRmHistory] = useState({});
+  const [rmLifts, setRmLifts] = useState(DEFAULT_RM_LIFTS);
+  const [rmRepsLifts, setRmRepsLifts] = useState(() => new Set(DEFAULT_RM_REPS_LIFTS));
+  const [fontSize, setFontSize] = useState("medium");
+  // rmInput is keyed by lift name — initialised for all current lifts
+  const [rmInput, setRmInput] = useState(() => Object.fromEntries(DEFAULT_RM_LIFTS.map(l => [l, ""])));
+
+  // ── Auth + cloud sync state ──
+  const [session, setSession] = useState(undefined); // undefined = checking, null = logged out
+  const [dataLoaded, setDataLoaded] = useState(false);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+
+  // Watch auth state — fires once on load, then again on sign-in/sign-out.
+  useEffect(() => {
+    sb.auth.getSession().then(({
+      data
+    }) => setSession(data.session || null));
+    const {
+      data: sub
+    } = sb.auth.onAuthStateChange((_event, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // Load this user's data from the cloud once logged in.
+  // First-ever login seeds the cloud row from whatever's still on THIS
+  // device's local storage (from the old phone-only version of the app),
+  // so existing history isn't lost in the switch.
+  useEffect(() => {
+    if (!session) return;
+    let cancelled = false;
+    (async () => {
+      const {
+        data: row
+      } = await sb.from("user_data").select("*").eq("user_id", session.user.id).maybeSingle();
+      if (cancelled) return;
+      if (row) {
+        setWorkouts(row.workouts || DEFAULT_WORKOUTS);
+        setDayNames(row.day_names || DEFAULT_DAY_NAMES);
+        setWorkoutLogs(row.workout_logs || {});
+        setRmHistory(row.rm_history || {});
+        setRmLifts(row.rm_lifts || DEFAULT_RM_LIFTS);
+        setRmRepsLifts(new Set(row.rm_reps_lifts || DEFAULT_RM_REPS_LIFTS));
+        setFontSize(row.font_size || "medium");
+      } else {
+        const seed = {
+          user_id: session.user.id,
+          workouts: lsGet("wl-wo", DEFAULT_WORKOUTS),
+          day_names: lsGet("wl-dn", DEFAULT_DAY_NAMES),
+          workout_logs: lsGet("wl-logs", {}),
+          rm_history: lsGet("wl-rm", {}),
+          rm_lifts: lsGet("wl-rm-lifts", DEFAULT_RM_LIFTS),
+          rm_reps_lifts: lsGet("wl-rm-reps", DEFAULT_RM_REPS_LIFTS),
+          font_size: lsGet("wl-fs", "medium")
+        };
+        await sb.from("user_data").insert(seed);
+        setWorkouts(seed.workouts);
+        setDayNames(seed.day_names);
+        setWorkoutLogs(seed.workout_logs);
+        setRmHistory(seed.rm_history);
+        setRmLifts(seed.rm_lifts);
+        setRmRepsLifts(new Set(seed.rm_reps_lifts));
+        setFontSize(seed.font_size);
+      }
+      if (!cancelled) setDataLoaded(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session && session.user.id]);
+
+  // Keep rmInput's keys in sync whenever the lift list loads/changes from the cloud.
+  useEffect(() => {
+    setRmInput(prev => {
+      const next = {
+        ...prev
+      };
+      let changed = false;
+      rmLifts.forEach(l => {
+        if (!(l in next)) {
+          next[l] = "";
+          changed = true;
+        }
+      });
+      return changed ? next : prev;
+    });
+  }, [rmLifts]);
 
   // ── UI state ──
   const [page, setPage] = useState("program");
@@ -633,8 +698,6 @@ function App() {
     title: "",
     subtitle: ""
   });
-  // rmInput is keyed by lift name — initialised for all current lifts
-  const [rmInput, setRmInput] = useState(() => Object.fromEntries(lsGet("wl-rm-lifts", DEFAULT_RM_LIFTS).map(l => [l, ""])));
   const [newRmLift, setNewRmLift] = useState("");
   const [confirm, setConfirm] = useState(null);
   const [showCSV, setShowCSV] = useState(false);
@@ -723,28 +786,160 @@ function App() {
     };
   }, [!!dragState]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Persist to localStorage on every relevant state change ──
+  // ── Persist to the cloud on every relevant state change ──
+  // Debounced so a burst of changes (e.g. saving a log then switching days)
+  // collapses into one network write instead of several.
   useEffect(() => {
-    lsSet("wl-wo", workouts);
-  }, [workouts]);
-  useEffect(() => {
-    lsSet("wl-dn", dayNames);
-  }, [dayNames]);
-  useEffect(() => {
-    lsSet("wl-logs", workoutLogs);
-  }, [workoutLogs]);
-  useEffect(() => {
-    lsSet("wl-rm", rmHistory);
-  }, [rmHistory]);
-  useEffect(() => {
-    lsSet("wl-rm-lifts", rmLifts);
-  }, [rmLifts]);
-  useEffect(() => {
-    lsSet("wl-rm-reps", [...rmRepsLifts]);
-  }, [rmRepsLifts]);
-  useEffect(() => {
-    lsSet("wl-fs", fontSize);
-  }, [fontSize]);
+    if (!dataLoaded || !session) return;
+    const t = setTimeout(() => {
+      sb.from("user_data").update({
+        workouts,
+        day_names: dayNames,
+        workout_logs: workoutLogs,
+        rm_history: rmHistory,
+        rm_lifts: rmLifts,
+        rm_reps_lifts: [...rmRepsLifts],
+        font_size: fontSize,
+        updated_at: new Date().toISOString()
+      }).eq("user_id", session.user.id).then(({
+        error
+      }) => {
+        if (error) console.warn("Save failed:", error);
+      });
+    }, 400);
+    return () => clearTimeout(t);
+  }, [workouts, dayNames, workoutLogs, rmHistory, rmLifts, rmRepsLifts, fontSize, dataLoaded, session]);
+
+  // ── Auth handlers ──
+  function submitLogin(e) {
+    e.preventDefault();
+    setAuthError("");
+    setAuthBusy(true);
+    sb.auth.signInWithPassword({
+      email: authEmail.trim(),
+      password: authPassword
+    }).then(({
+      error
+    }) => {
+      setAuthBusy(false);
+      if (error) setAuthError(error.message);
+    });
+  }
+  function signOut() {
+    sb.auth.signOut();
+    setDataLoaded(false);
+  }
+
+  // ── Screens shown before the main app: checking session / logged out / loading data ──
+  const screenWrap = content => /*#__PURE__*/React.createElement("div", {
+    style: {
+      minHeight: "100vh",
+      background: "#0c0c0c",
+      fontFamily: "'Courier New',Courier,monospace",
+      color: "#e8e8e8",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      padding: "24px"
+    }
+  }, content);
+  if (session === undefined) {
+    return screenWrap(/*#__PURE__*/React.createElement("div", {
+      style: {
+        color: "#555",
+        fontSize: "13px",
+        letterSpacing: "0.15em"
+      }
+    }, "LOADING…"));
+  }
+  if (session === null) {
+    return screenWrap(/*#__PURE__*/React.createElement("form", {
+      onSubmit: submitLogin,
+      style: {
+        width: "100%",
+        maxWidth: "340px"
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: "22px",
+        fontWeight: "bold",
+        color: "#fff",
+        marginBottom: "4px"
+      }
+    }, "TRAINING SPLIT"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: "11px",
+        color: "#555",
+        letterSpacing: "0.15em",
+        marginBottom: "24px"
+      }
+    }, "SIGN IN TO CONTINUE"), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "10px"
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "email",
+      autoComplete: "username",
+      placeholder: "Email",
+      value: authEmail,
+      onChange: e => setAuthEmail(e.target.value),
+      style: {
+        background: "#1a1a1a",
+        border: "1px solid #333",
+        color: "#f0f0f0",
+        padding: "12px",
+        fontSize: "16px",
+        fontFamily: "inherit",
+        outline: "none"
+      }
+    }), /*#__PURE__*/React.createElement("input", {
+      type: "password",
+      autoComplete: "current-password",
+      placeholder: "Password",
+      value: authPassword,
+      onChange: e => setAuthPassword(e.target.value),
+      style: {
+        background: "#1a1a1a",
+        border: "1px solid #333",
+        color: "#f0f0f0",
+        padding: "12px",
+        fontSize: "16px",
+        fontFamily: "inherit",
+        outline: "none"
+      }
+    }), authError && /*#__PURE__*/React.createElement("div", {
+      style: {
+        color: "#ff6666",
+        fontSize: "12px"
+      }
+    }, authError), /*#__PURE__*/React.createElement("button", {
+      type: "submit",
+      disabled: authBusy,
+      style: {
+        background: "#c8f542",
+        border: "none",
+        color: "#0c0c0c",
+        padding: "13px",
+        fontSize: "13px",
+        fontWeight: "bold",
+        letterSpacing: "0.1em",
+        cursor: authBusy ? "default" : "pointer",
+        fontFamily: "inherit",
+        opacity: authBusy ? 0.6 : 1
+      }
+    }, authBusy ? "SIGNING IN…" : "SIGN IN"))));
+  }
+  if (!dataLoaded) {
+    return screenWrap(/*#__PURE__*/React.createElement("div", {
+      style: {
+        color: "#555",
+        fontSize: "13px",
+        letterSpacing: "0.15em"
+      }
+    }, "LOADING YOUR DATA…"));
+  }
 
   // ── Derived values ──
   const FS = FONT_SIZES[fontSize] || FONT_SIZES.medium;
@@ -1698,6 +1893,30 @@ function App() {
       fontFamily: "inherit"
     }
   }, "ADD"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: "24px"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "11px",
+      letterSpacing: "0.2em",
+      color: "#555",
+      marginBottom: "12px"
+    }
+  }, "ACCOUNT"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: "12px",
+      color: "#777",
+      marginBottom: "10px"
+    }
+  }, session.user.email), /*#__PURE__*/React.createElement("button", {
+    onClick: signOut,
+    style: {
+      ...ghost,
+      width: "100%",
+      textAlign: "center"
+    }
+  }, "SIGN OUT")), /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: "24px"
     }

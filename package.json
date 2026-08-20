@@ -1,0 +1,7 @@
+{
+  "name": "workout-app",
+  "private": true,
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}
